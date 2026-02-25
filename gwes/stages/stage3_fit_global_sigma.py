@@ -457,7 +457,7 @@ def main() -> None:
     ap.add_argument("--sigma-seed", type=int, default=1)
     ap.add_argument("--sigma-min-maf", type=float, default=0.05)
     ap.add_argument("--sigma-sat-eps", type=float, default=0.01)
-    ap.add_argument("--sigma-ridge-lam", type=float, default=0.0)
+    ap.add_argument("--sigma-ridge-lam", type=float, default=1.0)
     ap.add_argument("--max-iter", type=int, default=50)
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--min-minor", type=int, default=3)
