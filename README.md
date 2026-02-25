@@ -321,15 +321,6 @@ Do not mix artifacts from different runs. Keep all inputs/outputs under the same
 
 ---
 
-## 10) Reproducibility
+## 10) For any unkown error
 
-* Stage metadata is written under `RUN_DIR/meta/stageX.json`.
-* Use a single `--run-dir` per run to keep all artifacts consistent.
-* For parameter sweeps, use distinct run directories.
-
-```
-
----
-
-If you want the next refinement, I’d suggest we add a small “Outputs by stage” table (just filenames + one-line meaning) and a consistent convention for where each stage writes its main TSV/NPZ (so users don’t have to guess paths).
-```
+Please use the Issues tab or report to seungwon.ko@biology.ox.ac.uk
