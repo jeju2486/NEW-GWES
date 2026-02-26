@@ -9,15 +9,16 @@ if _ROOT not in sys.path:
 import argparse
 import json
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
 try:
     import scipy.sparse as sp
     import scipy.sparse.linalg as spla
+    from scipy.optimize import minimize_scalar
 except Exception:
-    print("[error] Stage 3 requires scipy (sparse + eigsh).", file=sys.stderr)
+    print("[error] Stage 3 requires scipy (sparse + eigsh + optimize).", file=sys.stderr)
     raise
 
 from gwes.fasta_matrix import load_locusmajor_npz
@@ -38,8 +39,27 @@ def parse_sigma_grid(s: str) -> List[float]:
     return sorted(set(out))
 
 
-def objective_ridge_sigma(score_med: float, sigma: float, lam: float) -> float:
-    return float(score_med - 0.5 * lam * sigma * sigma)
+def trimmed_mean(x: np.ndarray, trim: float = 0.10) -> float:
+    """
+    Robust, smooth-ish aggregator for 1D optimizer stability.
+    trim=0.10 drops lowest/highest 10% before averaging.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.size
+    if n == 0:
+        return float("nan")
+    if trim <= 0.0 or n < 10:
+        return float(np.mean(x))
+    k = int(np.floor(trim * n))
+    if 2 * k >= n:
+        return float(np.mean(x))
+    xs = np.sort(x)
+    return float(np.mean(xs[k : (n - k)]))
+
+
+def objective_ridge_sigma(score_agg: float, sigma: float, lam: float) -> float:
+    # maximize: agg_score - 0.5 * lam * sigma^2
+    return float(score_agg - 0.5 * lam * sigma * sigma)
 
 
 def load_covariance_stage1(npz_path: str) -> Tuple[List[str], object, np.ndarray, int]:
@@ -102,6 +122,9 @@ def stage3_fit_global_sigma(
     sigma_min_maf: float = 0.05,
     sigma_sat_eps: float = 0.01,
     sigma_ridge_lam: float = 0.0,
+    sigma_trim: float = 0.10,
+    sigma_xatol_log: float = 0.02,
+    sigma_maxiter: int = 30,
     max_iter: int = 50,
     tol: float = 1e-6,
     min_minor: int = 3,
@@ -178,10 +201,25 @@ def stage3_fit_global_sigma(
         Z=Z64.astype(np.float32),
     )
 
-    # -------- sigma selection --------
+    # -------- sigma selection (Option 1: bounded 1D optimize on log(sigma)) --------
     grid = parse_sigma_grid(sigma_grid)
     lam_sigma = float(sigma_ridge_lam)
     n = int(n_tips)
+
+    # Use sigma_grid only to set search bounds; ignore sigma=0 for optimisation domain.
+    pos = [v for v in grid if v > 0.0]
+    if not pos:
+        raise ValueError("sigma-grid must include at least one positive value for optimisation bounds.")
+
+    # Heuristic bounds: expand a bit around provided positives.
+    sigma_floor = 1e-8
+    sigma_lo = max(sigma_floor, float(min(pos)) * 0.25)
+    sigma_hi = float(max(pos)) * 2.0
+    if sigma_hi <= sigma_lo:
+        sigma_hi = sigma_lo * 10.0
+
+    print(f"[info] Sigma search bounds: [{sigma_lo:.6g}, {sigma_hi:.6g}] (from sigma-grid)", file=sys.stderr)
+    print(f"[info] Ridge penalty lam_sigma={lam_sigma:g}, trim={float(sigma_trim):g}", file=sys.stderr)
 
     print(f"[info] Building sigma-scoring pool: MAF>={sigma_min_maf}, minor>={min_minor} ...", file=sys.stderr)
     eligible: List[int] = []
@@ -207,16 +245,21 @@ def stage3_fit_global_sigma(
     Y_sigma = loci_to_matrix_u8(Y_locus_bits, loci_sigma.tolist(), n_tips)  # (n_tips, m)
     mean_sigma = Y_sigma.mean(axis=0).astype(np.float64, copy=False)
 
+    # Warm starts across sigma evaluations
     alpha_ws = np.array([logit(float(mu)) for mu in mean_sigma], dtype=np.float64)
     b_ws = np.zeros((m, K), dtype=np.float64)
 
     sat_eps = float(sigma_sat_eps)
-    best_obj = -float("inf")
-    best_sigma = None
-    rows = []
 
-    print(f"[info] Scoring sigma grid on {m} loci (median Laplace) ...", file=sys.stderr)
-    for s in grid:
+    eval_records: List[Tuple[float, float, float, float, float, float, float, float, float, float]] = []
+    # columns: sigma, score_trimmean, score_med, score_mean, q10, q90, sat_med, sat_q90, conv_rate, objective
+
+    def score_sigma(s: float, *, tag: str = "") -> Tuple[float, float, float, float, float, float, float, float, float]:
+        """
+        Returns:
+          score_trimmean, score_med, score_mean, q10, q90, sat_med, sat_q90, conv_rate, objective
+        """
+        s_eff = float(max(sigma_floor, s))
         scores = np.zeros(m, dtype=np.float64)
         sat = np.zeros(m, dtype=np.float64)
         conv = np.zeros(m, dtype=np.bool_)
@@ -225,7 +268,7 @@ def stage3_fit_global_sigma(
             y = Y_sigma[:, j].astype(np.float64)
 
             a, b, ok, _, _, H = fit_locus_map(
-                y=y, Z=Z64, sigma=float(s),
+                y=y, Z=Z64, sigma=float(s_eff),
                 max_iter=max_iter, tol=tol,
                 init_alpha=float(alpha_ws[j]), init_b=b_ws[j, :]
             )
@@ -233,7 +276,7 @@ def stage3_fit_global_sigma(
             b_ws[j, :] = b
             conv[j] = bool(ok)
 
-            scores[j] = laplace_log_marginal(y, Z64, a, b, float(s), H)
+            scores[j] = laplace_log_marginal(y, Z64, a, b, float(s_eff), H)
 
             p = sigmoid(a + (Z64 @ b))
             sat[j] = float(np.mean((p < sat_eps) | (p > (1.0 - sat_eps))))
@@ -245,29 +288,70 @@ def stage3_fit_global_sigma(
         sat_med = float(np.median(sat))
         sat_q90 = float(np.quantile(sat, 0.90))
         conv_rate = float(np.mean(conv.astype(np.float64)))
-        obj = objective_ridge_sigma(score_med, float(s), lam_sigma)
 
-        print(
-            f"[info] sigma={s:g} median={score_med:.6g} mean={score_mean:.6g} "
-            f"q10={q10:.6g} q90={q90:.6g} sat_med={sat_med:.3f} sat_q90={sat_q90:.3f} "
-            f"conv={conv_rate:.3f} obj={obj:.6g} (lam={lam_sigma:g})",
-            file=sys.stderr,
-        )
-        rows.append((float(s), score_med, score_mean, q10, q90, sat_med, sat_q90, conv_rate, obj))
+        score_tmean = trimmed_mean(scores, trim=float(sigma_trim))
+        obj = objective_ridge_sigma(score_tmean, float(s), lam_sigma)
 
-        if (obj > best_obj + 1e-12) or (abs(obj - best_obj) <= 1e-12 and (best_sigma is None or float(s) < best_sigma)):
-            best_obj = obj
-            best_sigma = float(s)
+        if tag:
+            print(
+                f"[info] {tag} sigma={s:g} trimmean={score_tmean:.6g} med={score_med:.6g} "
+                f"q10={q10:.6g} q90={q90:.6g} sat_med={sat_med:.3f} conv={conv_rate:.3f} obj={obj:.6g}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[info] sigma={s:g} trimmean={score_tmean:.6g} med={score_med:.6g} "
+                f"q10={q10:.6g} q90={q90:.6g} sat_med={sat_med:.3f} conv={conv_rate:.3f} obj={obj:.6g}",
+                file=sys.stderr,
+            )
 
-    assert best_sigma is not None
-    sigma_hat = float(best_sigma)
+        eval_records.append((float(s), score_tmean, score_med, score_mean, q10, q90, sat_med, sat_q90, conv_rate, obj))
+        return score_tmean, score_med, score_mean, q10, q90, sat_med, sat_q90, conv_rate, obj
+
+    # Optimize u=log(sigma) to maximize objective; SciPy minimizes, so return -objective
+    def neg_objective_u(u: float) -> float:
+        s = float(np.exp(u))
+        _, _, _, _, _, _, _, _, obj = score_sigma(s)
+        return -obj
+
+    print(f"[info] Optimising sigma on log-scale (bounded, maxiter={int(sigma_maxiter)}, xatol_log={float(sigma_xatol_log):g}) ...",
+          file=sys.stderr)
+
+    res = minimize_scalar(
+        neg_objective_u,
+        bounds=(float(np.log(sigma_lo)), float(np.log(sigma_hi))),
+        method="bounded",
+        options={"xatol": float(sigma_xatol_log), "maxiter": int(sigma_maxiter)},
+    )
+
+    sigma_star = float(np.exp(res.x))
+    # also evaluate boundaries to be safe
+    rec_lo = score_sigma(sigma_lo, tag="bound")
+    rec_hi = score_sigma(sigma_hi, tag="bound")
+    rec_star = score_sigma(sigma_star, tag="opt")
+
+    # pick best among {lo, star, hi}
+    cands = [
+        (sigma_lo, rec_lo[-1]),
+        (sigma_star, rec_star[-1]),
+        (sigma_hi, rec_hi[-1]),
+    ]
+    # maximize objective; tie-break to smaller sigma
+    cands.sort(key=lambda t: (-t[1], t[0]))
+    sigma_hat = float(cands[0][0])
+
+    print(f"[info] Optimizer success={bool(res.success)} status={res.status} message={res.message}", file=sys.stderr)
     print(f"[info] Chosen global sigma_hat={sigma_hat:g}", file=sys.stderr)
 
     # global_sigma.tsv
     with (work3 / "global_sigma.tsv").open("w", encoding="utf-8") as f:
-        f.write("sigma\tscore_med\tscore_mean\tscore_q10\tscore_q90\tsat_med\tsat_q90\tconv_rate\tobjective\tlam_sigma\n")
-        for s, med, mean_sc, q10, q90, sm, sq90, cr, obj in rows:
-            f.write(f"{s}\t{med}\t{mean_sc}\t{q10}\t{q90}\t{sm}\t{sq90}\t{cr}\t{obj}\t{lam_sigma}\n")
+        f.write(
+            "sigma\tscore_trimmean\tscore_med\tscore_mean\tscore_q10\tscore_q90\t"
+            "sat_med\tsat_q90\tconv_rate\tobjective\tlam_sigma\tsigma_trim\n"
+        )
+        # sort rows by sigma for readability
+        for s, tmean, med, mean_sc, q10, q90, sm, sq90, cr, obj in sorted(eval_records, key=lambda r: r[0]):
+            f.write(f"{s}\t{tmean}\t{med}\t{mean_sc}\t{q10}\t{q90}\t{sm}\t{sq90}\t{cr}\t{obj}\t{lam_sigma}\t{sigma_trim}\n")
         f.write(f"chosen\t{sigma_hat}\n")
 
     # -------- fit all loci_used with sigma_hat --------
@@ -417,11 +501,16 @@ def stage3_fit_global_sigma(
             "k": K,
             "eig_tol": eig_tol,
             "eig_maxiter": eig_maxiter,
-            "sigma_grid": grid,
+            "sigma_grid_bounds_source": parse_sigma_grid(sigma_grid),
+            "sigma_bounds": [sigma_lo, sigma_hi],
             "sigma_loci": int(sigma_loci),
             "sigma_seed": int(sigma_seed),
             "sigma_min_maf": float(sigma_min_maf),
+            "sigma_sat_eps": float(sigma_sat_eps),
             "sigma_ridge_lam": float(sigma_ridge_lam),
+            "sigma_trim": float(sigma_trim),
+            "sigma_xatol_log": float(sigma_xatol_log),
+            "sigma_maxiter": int(sigma_maxiter),
             "min_minor": int(min_minor),
             "min_maf": float(min_maf),
             "threads": int(threads),
@@ -452,12 +541,20 @@ def main() -> None:
     ap.add_argument("--k", type=int, default=50)
     ap.add_argument("--eig-tol", type=float, default=1e-6)
     ap.add_argument("--eig-maxiter", type=int, default=5000)
+
+    # used as bounds source now (must include at least one positive)
     ap.add_argument("--sigma-grid", default="0,0.25,0.5,1,2,4,8,16,32,64")
     ap.add_argument("--sigma-loci", type=int, default=1000)
     ap.add_argument("--sigma-seed", type=int, default=1)
     ap.add_argument("--sigma-min-maf", type=float, default=0.05)
     ap.add_argument("--sigma-sat-eps", type=float, default=0.01)
     ap.add_argument("--sigma-ridge-lam", type=float, default=1.0)
+
+    # option-1 knobs
+    ap.add_argument("--sigma-trim", type=float, default=0.10, help="trim fraction for trimmed-mean aggregator (0..0.49)")
+    ap.add_argument("--sigma-xatol-log", type=float, default=0.02, help="optimizer tolerance in log(sigma) space")
+    ap.add_argument("--sigma-maxiter", type=int, default=30, help="optimizer max iterations")
+
     ap.add_argument("--max-iter", type=int, default=50)
     ap.add_argument("--tol", type=float, default=1e-6)
     ap.add_argument("--min-minor", type=int, default=3)
@@ -466,6 +563,9 @@ def main() -> None:
     ap.add_argument("--probs-format", choices=["auto", "npz", "memmap"], default="auto")
     ap.add_argument("--max-npz-floats", type=float, default=2e7)
     args = ap.parse_args()
+
+    if not (0.0 <= args.sigma_trim < 0.49):
+        raise ValueError("--sigma-trim must be in [0, 0.49).")
 
     meta = stage3_fit_global_sigma(
         run_dir=args.run_dir,
@@ -478,6 +578,9 @@ def main() -> None:
         sigma_min_maf=args.sigma_min_maf,
         sigma_sat_eps=args.sigma_sat_eps,
         sigma_ridge_lam=args.sigma_ridge_lam,
+        sigma_trim=args.sigma_trim,
+        sigma_xatol_log=args.sigma_xatol_log,
+        sigma_maxiter=args.sigma_maxiter,
         max_iter=args.max_iter,
         tol=args.tol,
         min_minor=args.min_minor,
