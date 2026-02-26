@@ -9,10 +9,10 @@ Core idea:
 - Fit per-locus **tip-level marginal probabilities** $p_i(t)$ that account for structured confounding.
 - For each candidate pair $(i,j)$, compute a **structured-mixture null** by averaging over tips:
   
-  $$
-  p_{11,\mathrm{null}} = \frac{1}{N}\sum_{t=1}^{N} p_i(t)\,p_j(t)
-  $$
-  
+$$
+p_{11,\mathrm{null}} = \frac{1}{N}\sum_{t=1}^{N} p_i(t)\,p_j(t)
+$$
+
   and similarly for $p_{00,\mathrm{null}}, p_{01,\mathrm{null}}, p_{10,\mathrm{null}}$, then compute residual statistics such as $\Delta_{11}$, residual log-OR, residual MI, and signed residual MI.
 
 The pipeline is organized as **stages** (stage0 … stage8). Each stage reads/writes artifacts under a single `--run-dir`, making runs reproducible and easier to debug.
