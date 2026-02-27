@@ -40,6 +40,7 @@ setup(
     python_requires=">=3.10",
     packages=find_packages(exclude=("tests", "docs")),
     include_package_data=True,
+    package_data={"gwes": ["scripts/*.r"]},
 
     # If you keep scripts/ at repo root, this installs it into a shared location.
     # Users should not assume scripts/ exists after installation; use package resources or a wrapper.
@@ -52,10 +53,6 @@ setup(
         "scipy>=1.10",
         "pandas>=1.5",
         "tqdm>=4.64",
-        # Add others your code actually imports at runtime, e.g.:
-        # "biopython>=1.80",
-        # "dendropy>=4.6",
-        # "ete3>=3.1.3",
     ],
     extras_require={
         "dev": [
@@ -79,6 +76,7 @@ setup(
         "gwes-stage6=gwes.stages.stage6_refit_flagged_loci_sigma_grid:main",
         "gwes-stage7=gwes.stages.stage7_patch_pairs_refined_bias:main",
         "gwes-stage8=gwes.stages.stage8_bootstrap_top_pairs:main",
+        "gwes-plot=gwes.cli_plot:main",
     ]
     },
 )

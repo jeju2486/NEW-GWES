@@ -314,7 +314,7 @@ def main():
     ap.add_argument("--min-minor", type=int, default=3)
     ap.add_argument("--min-maf", type=float, default=0.005)
 
-    ap.add_argument("--b-z", type=float, default=8.0)
+    ap.add_argument("--b-z", type=float, default=4.0)
     ap.add_argument("--b-norm-mult", type=float, default=4.0)
     ap.add_argument("--b-test", choices=["z", "mult"], default="z")
 
