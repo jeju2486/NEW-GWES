@@ -70,7 +70,7 @@ def read_spydrpick_pairs_whitespace_to_arrays(
             if len(parts) >= 6:
                 count_list.append(int(parts[5]))
             if len(parts) >= 7:
-                M2_list.append(int(parts[6]))
+                M2_list.append(float(parts[6]))
             if len(parts) >= 8:
                 mind_list.append(int(parts[7]))
             if len(parts) >= 9:

@@ -44,7 +44,6 @@ from gwes.pair_stats import (
     mi_max_given_marginals,
 )
 
-
 # -------------------------
 # Small helpers
 # -------------------------
@@ -146,6 +145,7 @@ class PairRec:
     i: int
     j: int
     distance: int
+    dist_bin: int
     n00: int
     n01: int
     n10: int
@@ -332,7 +332,8 @@ def stage8_bootstrap_top_pairs(
     stage3_dir: Optional[str] = None,
     p_override: Optional[str] = None,
     out_path: Optional[str] = None,
-    top: int = 1000,
+    top_per_bin: int = 1000,
+    bin_size: int = 10000,
     rank_by: Optional[str] = None,
     descending: bool = True,
     abs_rank: bool = False,
@@ -374,9 +375,9 @@ def stage8_bootstrap_top_pairs(
         P_ov, ov_locus_to_col = load_override_probs(ov_p, n_tips=n_tips, tips_base=tips_base)
         print(f"[info] Loaded P_override: loci={len(ov_locus_to_col)} from {ov_p}", file=sys.stderr)
 
-    # Scan file and keep top-N
+    # Scan file and keep top-N per bin
     t0 = time.perf_counter()
-    heap: List[Tuple[float, int, PairRec]] = []
+    heaps_by_bin: Dict[int, List[Tuple[float, int, PairRec]]] = {}
     scanned = 0
     tie = 0
 
@@ -457,32 +458,59 @@ def stage8_bootstrap_top_pairs(
                 except Exception:
                     dist = -1
 
-            # apply min-distance only if distance is known (>=0)
-            if min_distance > 0 and dist >= 0 and dist < min_distance:
+            if dist <= 0:
+                continue
+            
+            if min_distance > 0 and dist < min_distance:
                 continue
 
             rank_metric = abs(rv) if abs_rank else rv
             key = rank_metric if descending else -rank_metric  # larger key = better
 
-            rec = PairRec(i=i, j=j, distance=dist, n00=n00, n01=n01, n10=n10, n11=n11, rank_val=rv)
+            # distance bin: [k*bin_size, (k+1)*bin_size)
+            dist_bin = (dist // int(bin_size)) * int(bin_size)
+
+            rec = PairRec(
+                i=i, j=j, distance=dist, dist_bin=dist_bin,
+                n00=n00, n01=n01, n10=n10, n11=n11,
+                rank_val=rv,
+            )
+
+            h = heaps_by_bin.get(dist_bin)
+            if h is None:
+                h = []
+                heaps_by_bin[dist_bin] = h
 
             tie += 1
-            if len(heap) < int(top):
-                heapq.heappush(heap, (key, tie, rec))
+            if len(h) < int(top_per_bin):
+                heapq.heappush(h, (key, tie, rec))
             else:
-                if key > heap[0][0]:
-                    heapq.heapreplace(heap, (key, tie, rec))
-
+                if key > h[0][0]:
+                    heapq.heapreplace(h, (key, tie, rec))
+                    
             if progress_every > 0 and (scanned % int(progress_every)) == 0:
                 dt = time.perf_counter() - t0
-                print(f"[info] scanned={scanned:,} kept={len(heap)} rate={scanned/max(dt,1e-9):,.1f} lines/s", file=sys.stderr)
+                kept = sum(len(h) for h in heaps_by_bin.values())
+                print(f"[info] scanned={scanned:,}, bins={len(heaps_by_bin)}, kept={kept} rate={scanned/max(dt,1e-9):,.1f} lines/s", file=sys.stderr)
 
-    selected = [r for _, __, r in heap]
+    selected: List[PairRec] = []
+    for b in sorted(heaps_by_bin.keys()):
+        selected.extend([rec for _, __, rec in heaps_by_bin[b]])
+
+    # global ordering for execution/output (optional):
+    # 1) by bin, then 2) by rank within bin
     selected.sort(
-        key=lambda r: (abs(r.rank_val) if abs_rank else r.rank_val),
-        reverse=descending
+        key=lambda r: (
+            r.dist_bin,
+            -(abs(r.rank_val) if abs_rank else r.rank_val) if descending else (abs(r.rank_val) if abs_rank else r.rank_val)
+        )
     )
 
+    print(
+        f"[info] Selected {len(selected)} pairs = sum(top_per_bin per bin). "
+        f"bins={len(heaps_by_bin)} bin_size={bin_size} rank_by={rank_by}",
+        file=sys.stderr
+    )
     print(f"[info] Selected top {len(selected)} pairs for bootstrap (rank_by={rank_by})", file=sys.stderr)
 
     # Bootstrap in parallel
@@ -549,10 +577,10 @@ def stage8_bootstrap_top_pairs(
     # Write output
     with open(out_p, "w", encoding="utf-8") as f:
         if minimal:
-            f.write("v\tw\tdistance\trank_by\trank_val\tstat_obs\tp_primary\tq_primary\tmissing\n")
+            f.write("v\tw\tdistance\tdist_bin\trank_by\trank_val\tstat_obs\tp_primary\tq_primary\tmissing\n")
             for rec, row, pp, qq, so in zip(selected, out_rows, p_primary.tolist(), q_primary.tolist(), stat_obs.tolist()):
                 f.write(
-                    f"{rec.i}\t{rec.j}\t{rec.distance}\t{rank_by}\t{rec.rank_val:.10g}\t"
+                    f"{rec.i}\t{rec.j}\t{rec.distance}\t{rec.dist_bin}\t{rank_by}\t{rec.rank_val:.10g}\t"
                     f"{so:.10g}\t{pp:.10g}\t{qq:.10g}\t{int(row.get('missing', 1.0))}\n"
                 )
         else:
@@ -560,7 +588,7 @@ def stage8_bootstrap_top_pairs(
             # include srMI columns if computed
             has_srmi = compute_srmi
             f.write(
-                "v\tw\tdistance\tn00\tn01\tn10\tn11"
+                "v\tw\tdistance\tdist_bin\tn00\tn01\tn10\tn11"
                 "\trank_by\trank_val"
                 "\tdelta11_obs\tp_delta11\tz_delta11"
                 "\trlogOR_obs\tp_rlogOR\tz_rlogOR"
@@ -572,7 +600,7 @@ def stage8_bootstrap_top_pairs(
 
             for rec, row, pp, qq in zip(selected, out_rows, p_primary.tolist(), q_primary.tolist()):
                 f.write(
-                    f"{rec.i}\t{rec.j}\t{rec.distance}\t{rec.n00}\t{rec.n01}\t{rec.n10}\t{rec.n11}"
+                    f"{rec.i}\t{rec.j}\t{rec.distance}\t{rec.dist_bin}\t{rec.n00}\t{rec.n01}\t{rec.n10}\t{rec.n11}"
                     f"\t{rank_by}\t{rec.rank_val:.10g}"
                     f"\t{row.get('delta11_obs', np.nan):.10g}\t{row.get('p_delta11', np.nan):.10g}\t{row.get('z_delta11', np.nan):.10g}"
                     f"\t{row.get('rlogOR_obs', np.nan):.10g}\t{row.get('p_rlogOR', np.nan):.10g}\t{row.get('z_rlogOR', np.nan):.10g}"
@@ -596,7 +624,8 @@ def stage8_bootstrap_top_pairs(
             "p_override": str(ov_p) if ov_p is not None else None,
         },
         "params": {
-            "top": int(top),
+            "bin_size": int(bin_size),
+            "top_per_bin": int(top_per_bin),
             "rank_by": str(rank_by),
             "descending": bool(descending),
             "abs_rank": bool(abs_rank),
@@ -626,11 +655,13 @@ def main():
     ap.add_argument("--out", default=None, help="Output TSV. Default: work/stage8/stage8_bootstrap.tsv")
     ap.add_argument("--minimal", action="store_true", help="Write minimal output only (simple TSV).")
 
-    ap.add_argument("--top", type=int, default=1000)
     ap.add_argument("--rank-by", default=None)
     ap.add_argument("--ascending", dest="descending", action="store_false")
     ap.add_argument("--descending", dest="descending", action="store_true", default=True)
     ap.add_argument("--abs-rank", action="store_true")
+    
+    ap.add_argument("--bin-size", type=int, default=10000)
+    ap.add_argument("--top-per-bin", type=int, default=1000)
 
     ap.add_argument("--B", type=int, default=2000)
     ap.add_argument("--boot-block", type=int, default=256)
@@ -651,7 +682,8 @@ def main():
         stage3_dir=args.stage3_dir,
         p_override=args.p_override,
         out_path=args.out,
-        top=args.top,
+        bin_size=args.bin_size,
+        top_per_bin=args.top_per_bin,
         rank_by=args.rank_by,
         descending=args.descending,
         abs_rank=args.abs_rank,

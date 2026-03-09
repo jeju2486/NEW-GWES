@@ -1,52 +1,151 @@
 #!/usr/bin/env Rscript
-suppressPackageStartupMessages(library(data.table))
 
-# -------------------------
-# Args / parsing
-# -------------------------
+suppressPackageStartupMessages({
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    stop("Missing R package: data.table.", call. = FALSE)
+  }
+  library(data.table)
+})
 
-usage_and_quit <- function() {
+print_usage <- function() {
   cat("Usage:\n")
-  cat("  Rscript plot_stage7_8_pangwes_fast.R pairs_stage7.tsv out.png \\\n")
-  cat("    [y_col] [n_rows] [ld_dist] [ld_dist_alt] \\\n")
-  cat("    [stage8.tsv] [q_thresh] [min_dist] [max_points] [seed] [mask_cache_rds] \\\n")
-  cat("    [inblock_prefix_or_dir]\n")
-  quit(status = 1)
+  cat("  Rscript gwes_plotting.r -i stage7.tsv -o out.png -n N [options]\n\n")
+  cat("Required:\n")
+  cat("  -i, --input            Stage7 TSV (required)\n")
+  cat("  -o, --output           Output PNG (required)\n")
+  cat("  -n, --num-assemblies   Number of isolates/assemblies (required; PAN-GWES filtering)\n\n")
+  cat("Optional:\n")
+  cat("  -y, --y-col            y column (default: rMI_e). If srMI_e, uses rMI_e*sign(rlogOR)\n")
+  cat("      --n-rows           Read first N rows (default: all)\n")
+  cat("  -l, --ld-dist          LD distance line (default: 0)\n")
+  cat("      --ld-dist-alt      2nd LD line (default: 0)\n")
+  cat("      --stage8           Stage8 TSV for green overlay (default: none)\n")
+  cat("      --q-thresh         Stage8 q threshold (default: 0.05)\n")
+  cat("      --min-dist         Filter distance >= min-dist (default: 0)\n")
+  cat("      --max-points       Downsample background only (default: 0 off)\n")
+  cat("      --seed             RNG seed (default: 1)\n")
+  cat("      --inblock          Prefix/dir for per-block unitig files (default: none)\n")
+  cat("      --mask-cache       RDS cache path (default: auto)\n")
+  cat("      --no-deps          Force base plotting (no ggplot2/hexbin)\n")
+  cat("      --no-pangwes-filter Skip count/rsd filter\n")
+  cat("      --min-count-frac   Default 0.05\n")
+  cat("      --rsd-max          Default 1\n")
+  cat("  -h, --help             Help\n")
 }
 
-args <- commandArgs(trailingOnly = TRUE)
-if (length(args) < 2) usage_and_quit()
+parse_args <- function() {
+  args <- commandArgs(trailingOnly = TRUE)
+  o <- list(
+    input = NULL, output = NULL, num_assemblies = NULL,
+    y_col = "rMI_e", n_rows = 0, ld_dist = 0, ld_dist_alt = 0,
+    stage8 = NA_character_, q_thresh = 0.05,
+    min_dist = 0, max_points = 0, seed = 1L,
+    inblock = NA_character_, mask_cache = NA_character_,
+    no_deps = FALSE,
+    pangwes_filter = TRUE, min_count_frac = 0.05, rsd_max = 1
+  )
 
-infile       <- args[1]
-outfile      <- args[2]
-y_col        <- if (length(args) >= 3)  args[3]  else "rMI_e"
-n_rows       <- if (length(args) >= 4)  as.numeric(args[4])  else 0
-ld_dist      <- if (length(args) >= 5)  as.numeric(args[5])  else 0
-ld_dist_alt  <- if (length(args) >= 6)  as.numeric(args[6])  else 0
-stage8_path  <- if (length(args) >= 7)  args[7]  else NA
-q_thresh     <- if (length(args) >= 8)  as.numeric(args[8])  else 0.05
-min_dist     <- if (length(args) >= 9)  as.numeric(args[9])  else 0
-max_points   <- if (length(args) >= 10) as.numeric(args[10]) else 0
-seed         <- if (length(args) >= 11) as.integer(args[11]) else 1L
-mask_cache   <- if (length(args) >= 12) args[12] else NA
-inblock_path <- if (length(args) >= 13) args[13] else NA  # <-- OPTIONAL LAST ARG
+  i <- 1
+  while (i <= length(args)) {
+    a <- args[i]
 
-cat("Distance vs residual epistasis plot (PAN-GWES style) — Stage7/8 (FAST)\n")
-cat("Input (Stage7): ", infile, "\n", sep = "")
-cat("Output: ", outfile, "\n", sep = "")
-cat("y_col: ", y_col, "\n", sep = "")
-cat("min_dist filter: ", min_dist, "\n", sep = "")
-if (!is.na(stage8_path) && nzchar(stage8_path)) cat("Stage8: ", stage8_path, " (q<", q_thresh, ")\n", sep = "")
-if (!is.na(inblock_path) && nzchar(inblock_path)) cat("True-epistasis inblock: ", inblock_path, "\n", sep = "")
-if (max_points > 0) cat("max_points: ", max_points, " (downsample background only)\n", sep = "")
+    if (a %in% c("-h", "--help")) {
+      print_usage()
+      quit(status = 0)
 
-if (!file.exists(infile)) stop("Input file does not exist: ", infile, call. = FALSE)
+    } else if (a %in% c("-i", "--input")) {
+      o$input <- args[i + 1]
+      i <- i + 1
 
-t0 <- proc.time()[[3]]
+    } else if (a %in% c("-o", "--output")) {
+      o$output <- args[i + 1]
+      i <- i + 1
 
-# -------------------------
-# Helpers
-# -------------------------
+    } else if (a %in% c("-n", "--num-assemblies")) {
+      o$num_assemblies <- suppressWarnings(as.integer(args[i + 1]))
+      i <- i + 1
+      if (is.na(o$num_assemblies) || o$num_assemblies < 2) {
+        stop("-n must be integer >=2", call. = FALSE)
+      }
+
+    } else if (a %in% c("-y", "--y-col")) {
+      o$y_col <- args[i + 1]
+      i <- i + 1
+
+    } else if (a == "--n-rows") {
+      o$n_rows <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+
+    } else if (a %in% c("-l", "--ld-dist")) {
+      o$ld_dist <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+
+    } else if (a == "--ld-dist-alt") {
+      o$ld_dist_alt <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+
+    } else if (a == "--stage8") {
+      o$stage8 <- args[i + 1]
+      i <- i + 1
+
+    } else if (a == "--q-thresh") {
+      o$q_thresh <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+
+    } else if (a == "--min-dist") {
+      o$min_dist <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+
+    } else if (a == "--max-points") {
+      o$max_points <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+
+    } else if (a == "--seed") {
+      o$seed <- suppressWarnings(as.integer(args[i + 1]))
+      i <- i + 1
+
+    } else if (a == "--inblock") {
+      o$inblock <- args[i + 1]
+      i <- i + 1
+
+    } else if (a == "--mask-cache") {
+      o$mask_cache <- args[i + 1]
+      i <- i + 1
+
+    } else if (a == "--no-deps") {
+      o$no_deps <- TRUE
+
+    } else if (a == "--no-pangwes-filter") {
+      o$pangwes_filter <- FALSE
+
+    } else if (a == "--min-count-frac") {
+      o$min_count_frac <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+      if (!is.finite(o$min_count_frac) || o$min_count_frac <= 0 || o$min_count_frac > 1) {
+        stop("--min-count-frac in (0,1]", call. = FALSE)
+      }
+
+    } else if (a == "--rsd-max") {
+      o$rsd_max <- suppressWarnings(as.numeric(args[i + 1]))
+      i <- i + 1
+      if (!is.finite(o$rsd_max) || o$rsd_max <= 0) {
+        stop("--rsd-max > 0", call. = FALSE)
+      }
+
+    } else {
+      stop(paste0("Unknown option: ", a, " (use --help)"), call. = FALSE)
+    }
+
+    i <- i + 1
+  }
+
+  if (is.null(o$input) || is.null(o$output) || is.null(o$num_assemblies)) {
+    print_usage()
+    stop("Missing required: -i -o -n", call. = FALSE)
+  }
+
+  o
+}
 
 coerce_int_safe <- function(x) {
   xi <- suppressWarnings(as.integer(x))
@@ -57,28 +156,43 @@ coerce_int_safe <- function(x) {
 infer_pair_cols <- function(hdr) {
   if (("unitig_i" %in% hdr) && ("unitig_j" %in% hdr)) return(c("unitig_i", "unitig_j"))
   if (("v" %in% hdr) && ("w" %in% hdr)) return(c("v", "w"))
-  stop("Could not find pair columns. Need (unitig_i,unitig_j) or (v,w).", call. = FALSE)
+  stop("Need pair cols (unitig_i,unitig_j) or (v,w).", call. = FALSE)
 }
 
 pick_y_col <- function(hdr, y_col) {
   if (y_col %in% hdr) return(y_col)
   cand <- c("srMI_e", "rMI_e", "rMI_10", "rlogOR", "delta11", "MI_obs_e", "MI_null_e")
   pick <- cand[cand %in% hdr]
-  if (length(pick) == 0) stop("y_col not found and no fallback columns available.", call. = FALSE)
-  cat("Requested y_col not found; using fallback y_col=", pick[1], "\n", sep = "")
+  if (length(pick) == 0) stop("y_col not found and no fallbacks.", call. = FALSE)
+  cat("Requested y_col not found; using ", pick[1], "\n", sep = "")
   pick[1]
 }
 
-# Block file parsing
+compute_outlier_thresholds <- function(y) {
+  y <- y[is.finite(y)]
+  if (length(y) < 10) return(list(out = NA_real_, extreme = NA_real_))
+  q <- quantile(y, c(0.25, 0.75), na.rm = TRUE, names = FALSE, type = 7)
+  iqr <- q[2] - q[1]
+  list(out = q[2] + 1.5 * iqr, extreme = q[2] + 3.0 * iqr)
+}
+
 extract_block_idx <- function(fn) {
   bn <- basename(fn)
-  m <- regexec("_block_([0-9]+)_", bn)
+  m <- regexec("[._]block_([0-9]+)", bn)
   mm <- regmatches(bn, m)
   if (length(mm) >= 1 && length(mm[[1]]) >= 2) return(as.integer(mm[[1]][2]))
-  m2 <- regexec("_block_([0-9]+)", bn)
-  mm2 <- regmatches(bn, m2)
-  if (length(mm2) >= 1 && length(mm2[[1]]) >= 2) return(as.integer(mm2[[1]][2]))
   NA_integer_
+}
+
+list_per_block_files <- function(inblock_path) {
+  if (file.exists(inblock_path) && file.info(inblock_path)$isdir) {
+    list.files(inblock_path, pattern = "[._]block_[0-9]+\\.txt$", full.names = TRUE)
+  } else {
+    unique(c(
+      Sys.glob(paste0(inblock_path, ".block_*.txt")),
+      Sys.glob(paste0(inblock_path, "_block_*.txt"))
+    ))
+  }
 }
 
 build_mask_cache_path <- function(inblock_path, mask_cache) {
@@ -86,121 +200,125 @@ build_mask_cache_path <- function(inblock_path, mask_cache) {
   if (file.exists(inblock_path) && file.info(inblock_path)$isdir) {
     return(file.path(inblock_path, "unitig_blockmask_cache.rds"))
   }
-  paste0(inblock_path, "_unitig_blockmask_cache.rds")
+  paste0(inblock_path, ".unitig_blockmask_cache.rds")
 }
 
 load_or_build_unitig_masks <- function(inblock_path, cache_path) {
-  if (file.exists(cache_path)) {
-    cat("Loading cached unitig->mask map: ", cache_path, "\n", sep = "")
-    return(readRDS(cache_path))
+  if (file.exists(cache_path)) return(readRDS(cache_path))
+  files <- list_per_block_files(inblock_path)
+  if (length(files) == 0) return(data.table(unitig = integer(), mask = integer()))
+  else {
+    cat("Building unitig masks from", length(files), sep = " ")
   }
 
-  per_block_files <- character(0)
-  if (file.exists(inblock_path) && file.info(inblock_path)$isdir) {
-    per_block_files <- list.files(inblock_path, pattern = "_block_[0-9]+_.*\\.txt$", full.names = TRUE)
-  } else {
-    per_block_files <- unique(Sys.glob(paste0(inblock_path, "_block_*.txt")))
-  }
+  dt_list <- list()
+  seen <- integer(0)
 
-  if (length(per_block_files) == 0) {
-    warning("No per-block files found for inblock_path.")
-    return(data.table(unitig = integer(), mask = integer()))
-  }
-
-  cat("Detected ", length(per_block_files), " per-block unitig files.\n", sep = "")
-
-  dt_list <- vector("list", length(per_block_files))
-  keep <- 0L
-
-  for (fn in per_block_files) {
+  for (fn in files) {
     bidx <- extract_block_idx(fn)
     if (is.na(bidx)) next
-    if (bidx >= 30) warning("block_idx>=30 may overflow 32-bit bitmask in base R.")
+    seen <- c(seen, bidx)
     bit <- bitwShiftL(1L, bidx)
 
     u <- tryCatch(
       fread(fn, header = FALSE, sep = "\n", col.names = "unitig", showProgress = FALSE)[["unitig"]],
       error = function(e) character(0)
     )
+
     if (length(u) == 0) next
 
     ui <- suppressWarnings(as.integer(u))
     if (all(!is.na(ui))) {
-      dt_list[[keep + 1L]] <- data.table(unitig = ui, mask = bit)
+      dt_list[[length(dt_list) + 1]] <- data.table(unitig = ui, mask = bit)
     } else {
-      dt_list[[keep + 1L]] <- data.table(unitig = as.character(u), mask = bit)
+      dt_list[[length(dt_list) + 1]] <- data.table(unitig = as.character(u), mask = bit)
     }
-    keep <- keep + 1L
   }
 
-  if (keep == 0L) {
-    warning("No unitigs parsed from per-block files.")
-    return(data.table(unitig = integer(), mask = integer()))
-  }
+  if (length(dt_list) == 0) return(data.table(unitig = integer(), mask = integer()))
 
-  dt_all <- rbindlist(dt_list[seq_len(keep)], use.names = TRUE)
+  dt_all <- rbindlist(dt_list)
   dt_map <- dt_all[, .(mask = Reduce(bitwOr, unique(mask))), by = unitig]
   setkey(dt_map, unitig)
 
+  if (length(seen) > 0) attr(dt_map, "max_block_idx") <- max(seen, na.rm = TRUE)
   saveRDS(dt_map, cache_path)
-  cat("Wrote cached unitig->mask map: ", cache_path, "\n", sep = "")
   dt_map
 }
 
-# -------------------------
-# Load Stage7
-# -------------------------
+opts <- parse_args()
 
-hdr <- names(fread(infile, nrows = 0L, sep = "\t", showProgress = FALSE))
-if (!("distance" %in% hdr)) stop("Column 'distance' not found.", call. = FALSE)
+if (!file.exists(opts$input)) stop("Input missing: ", opts$input, call. = FALSE)
+if (file.exists(opts$output)) stop("Output exists, delete or change -o: ", opts$output, call. = FALSE)
+
+t0 <- proc.time()[[3]]
+
+hdr <- names(fread(opts$input, nrows = 0L, sep = "\t", showProgress = FALSE))
+if (!("distance" %in% hdr)) stop("Missing 'distance' column.", call. = FALSE)
 
 pair_cols <- infer_pair_cols(hdr)
 ui_col <- pair_cols[1]
 uj_col <- pair_cols[2]
-has_missing <- ("missing_loci" %in% hdr)
+has_missing <- "missing_loci" %in% hdr
+count_col <- if ("count" %in% hdr) "count" else NA_character_
+m2_col <- if ("M2" %in% hdr) "M2" else if ("d_M2" %in% hdr) "d_M2" else NA_character_
 
-y_col <- pick_y_col(hdr, y_col)
-need_rmi_rlo <- identical(y_col, "srMI_e")
+y_col_req <- pick_y_col(hdr, opts$y_col)
+need_sr <- identical(y_col_req, "srMI_e")
 
 cols_needed <- c("distance", ui_col, uj_col)
 if (has_missing) cols_needed <- c(cols_needed, "missing_loci")
-if (need_rmi_rlo) {
-  if (!("rMI_e" %in% hdr)) stop("Need column rMI_e to compute srMI_e.", call. = FALSE)
-  if (!("rlogOR" %in% hdr)) stop("Need column rlogOR to compute srMI_e.", call. = FALSE)
+if (opts$pangwes_filter) {
+  if (is.na(count_col) || is.na(m2_col)) {
+    stop("PAN-GWES filtering needs 'count' and 'M2' (or 'd_M2'). Use --no-pangwes-filter to bypass.", call. = FALSE)
+  }
+  cols_needed <- c(cols_needed, count_col, m2_col)
+}
+if (need_sr) {
   cols_needed <- c(cols_needed, "rMI_e", "rlogOR")
 } else {
-  cols_needed <- c(cols_needed, y_col)
+  cols_needed <- c(cols_needed, y_col_req)
 }
+cols_needed <- unique(cols_needed)
 
-n_to_read <- if (n_rows <= 0) Inf else as.integer(n_rows)
-
-dt7 <- fread(
-  infile,
-  sep = "\t",
-  nrows = n_to_read,
-  select = cols_needed,
-  showProgress = TRUE
-)
-
-cat("Read Stage7: ", nrow(dt7), " rows, ", ncol(dt7), " columns (selected).\n", sep = "")
+n_to_read <- if (!is.finite(opts$n_rows) || opts$n_rows <= 0) Inf else as.integer(opts$n_rows)
+dt7 <- fread(opts$input, sep = "\t", nrows = n_to_read, select = cols_needed, showProgress = TRUE)
+cat("Read rows: ", nrow(dt7), "\n", sep = "")
 
 dt7[, distance := suppressWarnings(as.numeric(distance))]
-dt7 <- dt7[is.finite(distance) & distance >= min_dist]
+n_disconnected <- sum(is.finite(dt7$distance) & dt7$distance == -1, na.rm = TRUE)
+
+dt7 <- dt7[is.finite(distance)]
+dt7 <- dt7[distance != -1]
+dt7 <- dt7[distance >= opts$min_dist]
 
 if (has_missing) {
   dt7[, missing_loci := suppressWarnings(as.numeric(missing_loci))]
   dt7 <- dt7[is.finite(missing_loci) & missing_loci == 0]
 }
 
-if (nrow(dt7) == 0) stop("No usable rows after filtering.", call. = FALSE)
+if (opts$pangwes_filter) {
+  dt7[, (count_col) := suppressWarnings(as.numeric(get(count_col)))]
+  dt7[, (m2_col) := suppressWarnings(as.numeric(get(m2_col)))]
+  min_count <- ceiling(opts$min_count_frac * opts$num_assemblies)
+  denom <- opts$num_assemblies - 1
+  dt7[, rsd := sqrt(pmax(get(m2_col), 0) / denom) / distance]
+  dt7[!is.finite(rsd), rsd := Inf]
+  before <- nrow(dt7)
+  dt7 <- dt7[is.finite(get(count_col)) & get(count_col) >= min_count]
+  dt7 <- dt7[is.finite(rsd) & rsd <= opts$rsd_max]
+  cat("PAN-GWES kept: ", nrow(dt7), " / ", before, " (min_count=", min_count, ")\n", sep = "")
+}
 
-if (need_rmi_rlo) {
+if (nrow(dt7) == 0) stop("No rows after filtering.", call. = FALSE)
+
+if (need_sr) {
   dt7[, rMI_e := suppressWarnings(as.numeric(rMI_e))]
   dt7[, rlogOR := suppressWarnings(as.numeric(rlogOR))]
   dt7 <- dt7[is.finite(rMI_e) & is.finite(rlogOR)]
   dt7[, y := rMI_e * sign(rlogOR)]
 } else {
-  dt7[, y := suppressWarnings(as.numeric(get(y_col)))]
+  dt7[, y := suppressWarnings(as.numeric(get(y_col_req)))]
   dt7 <- dt7[is.finite(y)]
 }
 
@@ -209,51 +327,28 @@ dt7[, uj := coerce_int_safe(get(uj_col))]
 dt7[, a := pmin(ui, uj)]
 dt7[, b := pmax(ui, uj)]
 
-t1 <- proc.time()[[3]]
-cat(sprintf("Time after Stage7 load+filter: %.2fs\n", t1 - t0))
-
-# -------------------------
-# Stage8 overlay (green)
-# -------------------------
-
 sig_pairs <- rep(FALSE, nrow(dt7))
-
-if (!is.na(stage8_path) && nzchar(stage8_path)) {
-  if (!file.exists(stage8_path)) stop("Stage8 file not found: ", stage8_path, call. = FALSE)
-
-  dt8 <- fread(stage8_path, sep = "\t", select = c("v", "w", "q_primary"), showProgress = TRUE)
+if (!is.na(opts$stage8) && nzchar(opts$stage8)) {
+  if (!file.exists(opts$stage8)) stop("Stage8 missing: ", opts$stage8, call. = FALSE)
+  dt8 <- fread(opts$stage8, sep = "\t", select = c("v", "w", "q_primary"), showProgress = TRUE)
   dt8[, q_primary := suppressWarnings(as.numeric(q_primary))]
-  dt8 <- dt8[is.finite(q_primary) & q_primary < q_thresh]
-
-  if (nrow(dt8) == 0) {
-    cat("Stage8: no pairs with q<", q_thresh, " ; overlay empty.\n", sep = "")
-  } else {
+  dt8 <- dt8[is.finite(q_primary) & q_primary < opts$q_thresh]
+  if (nrow(dt8) > 0) {
     dt8[, v := coerce_int_safe(v)]
     dt8[, w := coerce_int_safe(w)]
     dt8[, a := pmin(v, w)]
     dt8[, b := pmax(v, w)]
     dt8 <- dt8[, .(q = min(q_primary)), by = .(a, b)]
     setkey(dt8, a, b)
-
     q7 <- dt8[dt7, on = .(a, b), q]
-    sig_pairs <- is.finite(q7) & (q7 < q_thresh)
-    cat("Significant pairs in plotted set (q<", q_thresh, "): ", sum(sig_pairs), "\n", sep = "")
+    sig_pairs <- is.finite(q7) & (q7 < opts$q_thresh)
   }
 }
 
-t2 <- proc.time()[[3]]
-cat(sprintf("Time after Stage8 overlay: %.2fs\n", t2 - t1))
-
-# -------------------------
-# True-epistasis overlay (red) OPTIONAL LAST ARG
-# -------------------------
-
 highlight_pairs <- rep(FALSE, nrow(dt7))
-
-if (!is.na(inblock_path) && nzchar(inblock_path)) {
-  cache_path <- build_mask_cache_path(inblock_path, mask_cache)
-  dt_map <- load_or_build_unitig_masks(inblock_path, cache_path)
-
+if (!is.na(opts$inblock) && nzchar(opts$inblock)) {
+  cache_path <- build_mask_cache_path(opts$inblock, opts$mask_cache)
+  dt_map <- load_or_build_unitig_masks(opts$inblock, cache_path)
   if (nrow(dt_map) > 0) {
     idx1 <- match(dt7$ui, dt_map$unitig)
     idx2 <- match(dt7$uj, dt_map$unitig)
@@ -261,31 +356,31 @@ if (!is.na(inblock_path) && nzchar(inblock_path)) {
     m2 <- dt_map$mask[idx2]
     m1[is.na(m1)] <- 0L
     m2[is.na(m2)] <- 0L
-    highlight_pairs <- (m1 != 0L) & (m2 != 0L) & (bitwAnd(m1, m2) == 0L)
-    cat("True-epistasis highlighted pairs (different-block rule): ", sum(highlight_pairs), "\n", sep = "")
-  } else {
-    warning("Empty unitig->mask map; no in-block highlighting.")
+    max_block_idx <- attr(dt_map, "max_block_idx")
+    if (is.null(max_block_idx) || !is.finite(max_block_idx)) max_block_idx <- -1
+    n_pairs <- floor((max_block_idx + 1) / 2)
+    if (n_pairs > 0) {
+      hp <- rep(FALSE, length(m1))
+      for (g in 0:(n_pairs - 1)) {
+        bitA <- bitwShiftL(1L, 2 * g)
+        bitB <- bitwShiftL(1L, 2 * g + 1)
+        hp <- hp |
+          ((bitwAnd(m1, bitA) != 0L & bitwAnd(m2, bitB) != 0L) |
+           (bitwAnd(m1, bitB) != 0L & bitwAnd(m2, bitA) != 0L))
+      }
+      highlight_pairs <- hp
+    }
   }
-} else {
-  cat("No inblock_path provided; true-epistasis overlay disabled.\n")
 }
 
-t3 <- proc.time()[[3]]
-cat(sprintf("Time after in-block highlight: %.2fs\n", t3 - t2))
-
-# -------------------------
-# Downsample background only
-# -------------------------
-
-if (max_points > 0 && nrow(dt7) > max_points) {
+if (is.finite(opts$max_points) && opts$max_points > 0 && nrow(dt7) > opts$max_points) {
   keep <- sig_pairs | highlight_pairs
   n_keep <- sum(keep)
-  if (n_keep >= max_points) {
-    cat("Downsampling: keep-set already >= max_points; keeping only sig/highlight.\n")
+  if (n_keep >= opts$max_points) {
     sel <- keep
   } else {
-    set.seed(seed)
-    need <- max_points - n_keep
+    set.seed(opts$seed)
+    need <- opts$max_points - n_keep
     bg_idx <- which(!keep)
     take <- sample(bg_idx, size = need, replace = FALSE)
     sel <- keep
@@ -294,83 +389,156 @@ if (max_points > 0 && nrow(dt7) > max_points) {
   dt7 <- dt7[sel]
   sig_pairs <- sig_pairs[sel]
   highlight_pairs <- highlight_pairs[sel]
-  cat("After downsampling: ", nrow(dt7), " points.\n", sep = "")
 }
-
-# -------------------------
-# Plot (draw RED highlight last)
-# -------------------------
 
 distance <- dt7$distance
 y <- dt7$y
 
 max_distance <- max(distance, na.rm = TRUE)
-exponent <- max(0, round(log10(max_distance)) - 1)
-if (!is.finite(exponent)) exponent <- 0
-step <- 10^exponent
+if (!is.finite(max_distance) || max_distance <= 0) max_distance <- 1
 
-y_range <- range(y, finite = TRUE)
-if (!all(is.finite(y_range))) stop("Non-finite y-range for plotting.")
-if (y_range[1] == y_range[2]) {
-  eps <- ifelse(y_range[1] == 0, 1, abs(y_range[1]) * 0.1)
-  y_range <- y_range + c(-eps, eps)
-}
-y_ticks <- pretty(y_range, n = 8)
+x_step <- 50000
+x_max_tick <- ceiling(max_distance / x_step) * x_step
+x_breaks <- seq(0, x_max_tick, by = x_step)
 
-col_points    <- rgb(0, 115, 190, maxColorValue = 255)  # blue
-col_sig       <- "darkgreen"
-col_highlight <- "red"
-col_ld        <- "red"
-col_ld_alt    <- "hotpink1"
+max_abs_y <- max(abs(y[is.finite(y)]), na.rm = TRUE)
+if (!is.finite(max_abs_y) || max_abs_y == 0) max_abs_y <- 1
+y_lim <- c(-max_abs_y, max_abs_y)
+y_ticks <- pretty(y_lim, n = 8)
 
-pch_pt <- 19
-cex_pt <- 0.2
+thr <- compute_outlier_thresholds(y)
+outlier_threshold <- thr$out
+extreme_outlier_threshold <- thr$extreme
 
-outdir <- dirname(outfile)
+col_bg_blue <- rgb(0, 115, 190, alpha = 60, maxColorValue = 255)
+col_sig <- "darkgreen"
+col_high <- "red"
+col_ld <- "black"
+col_ld_alt <- "hotpink1"
+col_out <- rgb(165, 0, 38, maxColorValue = 255)
+col_ext <- rgb(215, 48, 39, maxColorValue = 255)
+
+plot_width <- 2400
+plot_height <- 1200
+plot_pointsize <- 16
+outdir <- dirname(opts$output)
 if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
-png(outfile, width = 1920, height = 1080, pointsize = 16)
+have_ggplot2 <- (!opts$no_deps) &&
+  requireNamespace("ggplot2", quietly = TRUE) &&
+  requireNamespace("hexbin", quietly = TRUE)
 
-plot(distance, y,
-     col   = col_points,
-     type  = "p",
-     pch   = pch_pt,
-     cex   = cex_pt,
-     xlim  = c(0, max_distance),
-     ylim  = y_range,
-     xaxs  = "i",
-     yaxs  = "i",
-     xlab  = "",
-     ylab  = "",
-     xaxt  = "n",
-     yaxt  = "n",
-     bty   = "n")
+have_ggrastr <- have_ggplot2 && requireNamespace("ggrastr", quietly = TRUE)
+have_ggthemes <- have_ggplot2 && requireNamespace("ggthemes", quietly = TRUE)
 
-# Draw LD lines BEFORE overlays, so red highlight points always sit on top
-if (ld_dist > 0)     segments(ld_dist, y_range[1], ld_dist, y_range[2], col = col_ld, lty = 2)
-if (ld_dist_alt > 0) segments(ld_dist_alt, y_range[1], ld_dist_alt, y_range[2], col = col_ld_alt, lty = 2)
+n_connected_k <- floor(nrow(dt7) / 1000)
+n_disconnected_k <- floor(n_disconnected / 1000)
 
-# Stage8 significant overlay (green)
-if (any(sig_pairs)) {
-  points(distance[sig_pairs], y[sig_pairs], col = col_sig, pch = pch_pt, cex = cex_pt)
+if (have_ggplot2) {
+  suppressPackageStartupMessages(library(ggplot2))
+  suppressPackageStartupMessages(library(hexbin))
+  if (have_ggrastr) suppressPackageStartupMessages(library(ggrastr))
+  if (have_ggthemes) suppressPackageStartupMessages(library(ggthemes))
+
+  dtp <- data.table(distance = distance, y = y, sig = sig_pairs, high = highlight_pairs)
+  dt_bg <- dtp[!(sig | high)]
+  dt_sig <- dtp[sig]
+  dt_high <- dtp[high]
+
+  p <- ggplot()
+
+  if (nrow(dt_bg) > 0) {
+    layer <- geom_hex(data = dt_bg, aes(x = distance, y = y), bins = 500, fill = col_bg_blue)
+    if (have_ggrastr) layer <- ggrastr::rasterise(layer, dpi = 1000)
+    p <- p + layer
+  }
+
+  p <- p + geom_hline(yintercept = 0, col = "black", linetype = "dashed", linewidth = 0.3)
+
+  if (is.finite(outlier_threshold)) {
+    p <- p + geom_hline(yintercept = outlier_threshold, col = col_out, linetype = "dashed", linewidth = 0.3)
+  }
+  if (is.finite(extreme_outlier_threshold)) {
+    p <- p + geom_hline(yintercept = extreme_outlier_threshold, col = col_ext, linetype = "dashed", linewidth = 0.3)
+  }
+
+  if (is.finite(opts$ld_dist) && opts$ld_dist > 0) {
+    p <- p + geom_vline(xintercept = opts$ld_dist, col = col_ld, linetype = "dashed", linewidth = 0.3)
+  }
+  if (is.finite(opts$ld_dist_alt) && opts$ld_dist_alt > 0) {
+    p <- p + geom_vline(xintercept = opts$ld_dist_alt, col = col_ld_alt, linetype = "dashed", linewidth = 0.3)
+  }
+
+  if (nrow(dt_sig) > 0) p <- p + geom_point(data = dt_sig, aes(x = distance, y = y), col = col_sig, pch = 19, size = 0.35)
+  if (nrow(dt_high) > 0) p <- p + geom_point(data = dt_high, aes(x = distance, y = y), col = col_high, pch = 19, size = 0.35)
+
+  base_theme <- if (have_ggthemes) ggthemes::theme_clean(base_size = 10) else theme_minimal(base_size = 10)
+
+  p <- p +
+    scale_x_continuous(breaks = x_breaks, labels = x_breaks, limits = c(0, x_max_tick)) +
+    scale_y_continuous(breaks = y_ticks, limits = y_lim) +
+    labs(x = "Distance between unitigs (bp)", y = opts$y_col) +
+    base_theme +
+    theme(legend.position = "none")
+
+  ann1 <- paste0("#Connected: ", n_connected_k, "K")
+  ann2 <- paste0("#Disconnected: ", n_disconnected_k, "K")
+  ann3 <- paste0("Stage8 sig: ", sum(sig_pairs), " | True epi: ", sum(highlight_pairs))
+  p <- p +
+    annotate("text", x = x_max_tick * 0.98, y = y_lim[1] + 0.88 * diff(y_lim), label = ann1, hjust = 1, size = 3.2) +
+    annotate("text", x = x_max_tick * 0.98, y = y_lim[1] + 0.84 * diff(y_lim), label = ann2, hjust = 1, size = 3.2) +
+    annotate("text", x = x_max_tick * 0.98, y = y_lim[1] + 0.80 * diff(y_lim), label = ann3, hjust = 1, size = 3.2)
+
+  ggplot2::ggsave(
+    filename = opts$output,
+    plot = p,
+    device = "png",
+    width = plot_width,
+    height = plot_height,
+    units = "px"
+  )
+
+} else {
+  png(opts$output, width = plot_width, height = plot_height, pointsize = plot_pointsize)
+
+  plot(
+    distance, y,
+    col = col_bg_blue, type = "p", pch = 19, cex = 0.10,
+    xlim = c(0, x_max_tick), ylim = y_lim, xaxs = "i", yaxs = "i",
+    xlab = "", ylab = "", xaxt = "n", yaxt = "n", bty = "n"
+  )
+
+  segments(0, 0, x_max_tick, 0, col = "black", lty = 2, lwd = 1)
+
+  if (is.finite(outlier_threshold)) {
+    segments(0, outlier_threshold, x_max_tick, outlier_threshold, col = col_out, lty = 2, lwd = 2)
+  }
+  if (is.finite(extreme_outlier_threshold)) {
+    segments(0, extreme_outlier_threshold, x_max_tick, extreme_outlier_threshold, col = col_ext, lty = 2, lwd = 2)
+  }
+
+  if (is.finite(opts$ld_dist) && opts$ld_dist > 0) {
+    segments(opts$ld_dist, y_lim[1], opts$ld_dist, y_lim[2], col = col_ld, lty = 2, lwd = 2)
+  }
+  if (is.finite(opts$ld_dist_alt) && opts$ld_dist_alt > 0) {
+    segments(opts$ld_dist_alt, y_lim[1], opts$ld_dist_alt, y_lim[2], col = col_ld_alt, lty = 2, lwd = 2)
+  }
+
+  if (any(sig_pairs)) points(distance[sig_pairs], y[sig_pairs], col = col_sig, pch = 19, cex = 0.18)
+  if (any(highlight_pairs)) points(distance[highlight_pairs], y[highlight_pairs], col = col_high, pch = 19, cex = 0.18)
+
+  axis(1, at = x_breaks, tick = FALSE, labels = x_breaks, line = -0.8)
+  title(xlab = "Distance between unitigs (bp)", line = 1.2)
+
+  axis(2, at = y_ticks, labels = FALSE, tcl = -0.5)
+  axis(2, at = y_ticks, labels = y_ticks, las = 1, tcl = -0.5)
+  title(ylab = opts$y_col, line = 2.5)
+
+  text(0.90 * x_max_tick, y_lim[1] + 0.88 * diff(y_lim), paste0("#Connected: ", n_connected_k, "K"), cex = 0.8, adj = 0)
+  text(0.90 * x_max_tick, y_lim[1] + 0.84 * diff(y_lim), paste0("#Disconnected: ", n_disconnected_k, "K"), cex = 0.8, adj = 0)
+
+  dev.off()
 }
 
-# True epistasis overlay (red) LAST
-if (any(highlight_pairs)) {
-  points(distance[highlight_pairs], y[highlight_pairs], col = col_highlight, pch = pch_pt, cex = cex_pt)
-}
-
-axis(1, at = seq(0, max_distance, step), tick = FALSE, labels = seq(0, max_distance / step), line = -0.8)
-title(xlab = "Distance between unitigs (bp)", line = 1.2)
-title(xlab = substitute(x10^exp, list(exp = exponent)), line = 1.4, adj = 1)
-
-axis(2, at = y_ticks, labels = FALSE, tcl = -0.5)
-axis(2, at = y_ticks, labels = y_ticks, las = 1, tcl = -0.5)
-title(ylab = paste0(y_col, " (linear)"), line = 2.5)
-
-dev.off()
-
-t_end <- proc.time()[[3]]
-cat(sprintf("Wrote: %s\n", outfile))
-cat(sprintf("Time plotting: %.2fs\n", t_end - t3))
-cat(sprintf("Total time: %.2fs\n", t_end - t0))
+cat(sprintf("Wrote: %s\n", opts$output))
+cat(sprintf("Total time: %.2fs\n", proc.time()[[3]] - t0))
